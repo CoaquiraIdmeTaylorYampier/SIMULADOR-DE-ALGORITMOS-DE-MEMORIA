@@ -110,74 +110,101 @@ def leer_archivo(path, tipo):
 # ══════════════════════════════════════════════
 #  SIMULACIÓN COMPLETA (lógica correcta)
 # ══════════════════════════════════════════════
-def simular(procesos, particiones_obj, algo_fn):
-    """
-    Devuelve:
-      - procesos con inicio/fin/particion calculados
-      - events: lista de dicts para la animación Gantt/Memoria
-        cada evento: {tiempo, tipo: 'entrada'|'salida', proceso, particion_idx}
-    """
+def unir_huecos_libres(particiones):
+    nuevas = []
+    for part in particiones:
+        if part.libre and nuevas and nuevas[-1].libre:
+            nuevas[-1].tamanio += part.tamanio
+        else:
+            nuevas.append(part)
+
+    for i, part in enumerate(nuevas):
+        part.idx = i
+
+    return nuevas
+
+
+def simular(procesos, particiones_obj, algo_fn, dinamica=False):
     procs = [copy.deepcopy(p) for p in procesos]
     parts = [copy.deepcopy(p) for p in particiones_obj]
 
-    # Cola de espera (procesos no asignados aún)
+
     cola = list(procs)
-    activos = []   # (proceso, particion, fin_time)
-    events  = []
-    tiempo  = 0.0
-    EPS     = 1e-9
+    activos = []
+    events = []
+    tiempo = 0.0
+    EPS = 1e-9
 
     max_iter = 0
     while (cola or activos) and max_iter < 10000:
         max_iter += 1
 
-        # 1. Recoger todos los tiempos de fin de activos
-        tiempos_fin = sorted(set(round(a[2], 6) for a in activos))
+        # Asignar en orden estricto de cola:
+        # solo se intenta cargar el primer proceso pendiente.
+        while cola:
+            proc = cola[0]
+            part = algo_fn(parts, proc)
 
-        # 2. Asignar desde la cola mientras haya particiones libres
-        asignados_en_este_ciclo = True
-        while asignados_en_este_ciclo and cola:
-            asignados_en_este_ciclo = False
-            for proc in cola[:]:
-                part = algo_fn(parts, proc)
-                if part:
-                    part.libre    = False
-                    part.ocupante = proc.nombre
-                    proc.inicio   = round(tiempo, 6)
-                    proc.fin      = round(tiempo + proc.tiempo, 6)
-                    proc.particion = part.idx
-                    proc.asignado  = True
-                    activos.append((proc, part, proc.fin))
-                    cola.remove(proc)
-                    events.append({
-                        "tiempo"  : round(tiempo, 6),
-                        "tipo"    : "entrada",
-                        "proceso" : proc,
-                        "part_idx": part.idx,
-                    })
-                    asignados_en_este_ciclo = True
+            # Si el primero de la cola no entra, nadie más puede adelantarse.
+            if not part:
+                break
+
+            if dinamica:
+                idx = parts.index(part)
+                sobrante = part.tamanio - proc.memoria
+
+                part.tamanio = proc.memoria
+                part.libre = False
+                part.ocupante = proc.nombre
+
+                if sobrante > 0:
+                    parts.insert(idx + 1, Particion(0, sobrante))
+
+                for i, p in enumerate(parts):
+                    p.idx = i
+            else:
+                part.libre = False
+                part.ocupante = proc.nombre
+
+            proc.inicio = round(tiempo, 6)
+            proc.fin = round(tiempo + proc.tiempo, 6)
+            proc.particion = part.idx
+            proc.asignado = True
+
+            activos.append((proc, part, proc.fin))
+            cola.pop(0)
+
+            events.append({
+                "tiempo": round(tiempo, 6),
+                "tipo": "entrada",
+                "proceso": proc,
+                "snapshot": copy.deepcopy(parts),
+            })
 
         if not activos:
             break
 
-        # 3. Avanzar al próximo evento de fin
         proximo_fin = min(a[2] for a in activos)
         tiempo = proximo_fin
 
-        # 4. Liberar los que terminan en este tiempo
         nuevos_activos = []
-        for (proc, part, fin) in activos:
+        for proc, part, fin in activos:
             if abs(fin - tiempo) < EPS:
-                part.libre    = True
+                part.libre = True
                 part.ocupante = None
+
+                if dinamica:
+                    parts = unir_huecos_libres(parts)
+
                 events.append({
-                    "tiempo"  : round(tiempo, 6),
-                    "tipo"    : "salida",
-                    "proceso" : proc,
-                    "part_idx": part.idx,
+                    "tiempo": round(tiempo, 6),
+                    "tipo": "salida",
+                    "proceso": proc,
+                    "snapshot": copy.deepcopy(parts),
                 })
             else:
                 nuevos_activos.append((proc, part, fin))
+
         activos = nuevos_activos
 
     return procs, events
@@ -486,7 +513,8 @@ class App(tk.Tk):
             return
         try:
             tam_total = int(self.tam_mem_var.get())
-            if tam_total < 1: raise ValueError
+            if tam_total < 1:
+                raise ValueError
         except ValueError:
             messagebox.showerror("Error", "Tamaño de memoria inválido.")
             return
@@ -507,68 +535,66 @@ class App(tk.Tk):
 
         # Construir particiones
         if self.tipo_mem_var.get() == "Fija" and particiones_tam:
-            self._particiones = [Particion(i, t)
-                                  for i, t in enumerate(particiones_tam)]
+            self._particiones = [Particion(i, t) for i, t in enumerate(particiones_tam)]
         else:
-            # Dinámica: una partición por proceso (tamaño = memoria del proceso)
-            self._particiones = [Particion(i, p.memoria)
-                                  for i, p in enumerate(procesos)]
+            # Dinámica: toda la memoria empieza como un solo hueco libre
+            self._particiones = [Particion(0, tam_total)]
 
-        # Colores
-        self._color_map = {p.nombre: PROC_COLORS[i % len(PROC_COLORS)]
-                           for i, p in enumerate(procesos)}
+        self._color_map = {
+            p.nombre: PROC_COLORS[i % len(PROC_COLORS)]
+            for i, p in enumerate(procesos)
+        }
 
         # Simular
         algo_fn = ALGOS[self.algoritmo_var.get()]
-        procs, events = simular(procesos, self._particiones, algo_fn)
-        self._procesos = procs
-        self._events   = events
+        es_dinamica = self.tipo_mem_var.get() == "Dinámica"
+        procs, events = simular(procesos, self._particiones, algo_fn, es_dinamica)
 
-        # Recalcular particiones originales para el mapa de memoria
+        self._procesos = procs
+        self._events = events
+
+        # Estado inicial del mapa
         if self.tipo_mem_var.get() == "Fija" and particiones_tam:
-            self._particiones = [Particion(i, t)
-                                  for i, t in enumerate(particiones_tam)]
+            self._particiones = [Particion(i, t) for i, t in enumerate(particiones_tam)]
         else:
-            self._particiones = [Particion(i, p.memoria)
-                                  for i, p in enumerate(procesos)]
+            self._particiones = [Particion(0, tam_total)]
 
         # Poblar tabla
-        # todos los procesos llegan en T=0 (T.llegada = 0)
         for i, p in enumerate(procs):
             if p.asignado:
-                tr = round(p.fin - 0, 4)          # TR = T.fin - T.llegada(0)
-                te = round(p.inicio - 0, 4)        # TE = T.inicio - T.llegada(0)
+                tr = round(p.fin, 4)
+                te = round(p.inicio, 4)
             else:
                 tr = te = "—"
+
             tag = "even" if i % 2 == 0 else "odd"
             self.tree.insert("", "end", tags=(tag,), values=(
-                p.nombre, p.memoria, p.tiempo,
+                p.nombre,
+                p.memoria,
+                p.tiempo,
                 p.inicio if p.asignado else "—",
-                p.fin    if p.asignado else "—",
-                tr, te,
+                p.fin if p.asignado else "—",
+                tr,
+                te,
             ))
-        self.tree.tag_configure("even", background=BG_CARD)
-        self.tree.tag_configure("odd",  background=BG_INPUT)
 
-        # Actualizar promedios en header
+        self.tree.tag_configure("even", background=BG_CARD)
+        self.tree.tag_configure("odd", background=BG_INPUT)
+
         asignados = [p for p in procs if p.asignado]
         if asignados:
-            avg_tr = round(sum(p.fin - 0 for p in asignados) / len(asignados), 3)
-            avg_te = round(sum(p.inicio - 0 for p in asignados) / len(asignados), 3)
+            avg_tr = round(sum(p.fin for p in asignados) / len(asignados), 3)
+            avg_te = round(sum(p.inicio for p in asignados) / len(asignados), 3)
             self._hdr_tr.configure(text=str(avg_tr))
             self._hdr_te.configure(text=str(avg_te))
         else:
             self._hdr_tr.configure(text="—")
             self._hdr_te.configure(text="—")
 
-        # Leyenda
         self._build_leyenda()
-
-        # Dibujar mapa de memoria (estado inicial)
         self._draw_mem_snapshot(tam_total, {})
-
-        # Preparar y arrancar animación Gantt + Memoria
         self._build_gantt_layout()
+
         self._sim_running = True
         self._animate_events(0, tam_total)
 
@@ -583,7 +609,6 @@ class App(tk.Tk):
         for w in self.leyenda_frame.winfo_children():
             w.destroy()
 
-    # ══ ANIMACIÓN ══════════════════════════════════
     def _animate_events(self, idx, tam_total):
         if not self._sim_running:
             return
@@ -592,27 +617,19 @@ class App(tk.Tk):
 
         ev = self._events[idx]
 
-        # Actualizar estado de particiones
-        for p in self._particiones:
-            if p.idx == ev["part_idx"]:
-                if ev["tipo"] == "entrada":
-                    p.libre    = False
-                    p.ocupante = ev["proceso"].nombre
-                else:
-                    p.libre    = True
-                    p.ocupante = None
-                break
+        self._particiones = copy.deepcopy(ev["snapshot"])
 
-        # Redibujar mapa de memoria
-        ocupadas = {p.idx: p.ocupante for p in self._particiones if not p.libre}
+        ocupadas = {
+            p.idx: p.ocupante
+            for p in self._particiones
+            if not p.libre
+        }
+
         self._draw_mem_snapshot(tam_total, ocupadas)
 
-        # Pintar segmento Gantt
         if ev["tipo"] == "entrada":
-            proc = ev["proceso"]
-            self._draw_gantt_segment(proc)
+            self._draw_gantt_segment(ev["proceso"])
 
-        # Siguiente evento con delay proporcional
         delay = 600
         self.after(delay, self._animate_events, idx + 1, tam_total)
 
